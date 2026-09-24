@@ -1,0 +1,43 @@
+# Challenge data (never commit)
+dataset/
+data/raw/
+*.tsv.gz
+
+# Virtual environments and secrets
+.venv/
+venv/
+.env
+.env.*
+
+# Python
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Notebooks / IDE
+.ipynb_checkpoints/
+.idea/
+.vscode/
+*.swp
+
+# Artifacts
+models/
+checkpoints/
+artifacts/
+cache/
+logs/
+output/*.tsv
+output/*.csv
+!output/.gitkeep
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,0 +1,42 @@
+# Baseline configuration for local development.
+# Paths are relative to the repository root unless overridden by env vars:
+#   BER_TRAIN_DIR, BER_TEST_DIR, BER_OUTPUT_DIR
+
+seed: 42
+validation_fraction: 0.2
+
+paths:
+  train_dir: dataset/train
+  test_dir: dataset/test
+  output_dir: output
+  models_dir: models
+
+blocking:
+  methods:
+    - exact_normalized_name
+    - exact_name_without_legal_suffix
+    - exact_normalized_address
+    - exact_name_and_address
+  max_candidates_per_s1: 200
+  # Later: char_tfidf, word_tfidf, numeric_address, postcode_token, fuzzy, source_aware
+
+features:
+  set: baseline_v1
+  # Later: rapidfuzz, levenshtein, jaro, jaccard, char_tfidf_cosine, word_tfidf_cosine
+
+model:
+  type: logistic_regression
+  params:
+    C: 1.0
+    class_weight: balanced
+    max_iter: 1000
+    solver: lbfgs
+
+threshold:
+  value: 0.7
+  # Do not assume 0.5 is optimal. Sweep on validation S1 entities.
+
+runtime:
+  n_jobs: 1
+  log_memory_sensitive_ops: true
+  stream_submission: true
