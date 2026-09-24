@@ -5,6 +5,7 @@ Every read uses ``sep="\\t"``. Raw files are never modified.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any, Iterator, Sequence
 
@@ -32,6 +33,14 @@ class DataSchemaError(ValueError):
     """Raised when a TSV does not match the expected challenge schema."""
 
 
+class GroundTruthError(ValueError):
+    """Raised when ground-truth IDs are malformed."""
+
+
+S1_ID_RE = re.compile(r"^S1-[A-Za-z0-9]+$")
+MATCH_ID_RE = re.compile(r"^S[23]-[A-Za-z0-9]+$")
+
+
 def _as_path(path: str | Path) -> Path:
     return Path(path)
 
@@ -54,7 +63,6 @@ def _read_tsv(
             keep_default_na=False,
             na_filter=False,
             usecols=list(usecols) if usecols is not None else None,
-            engine="python",
         )
     except Exception as exc:  # pandas may raise ParserError subclasses
         raise DataSchemaError(f"Failed to parse TSV {path}: {exc}") from exc
@@ -108,8 +116,11 @@ def load_source3(path: str | Path, *, columns: Sequence[str] | None = None) -> p
     return load_source_table(path, columns=columns)
 
 
-def parse_matched_ids(raw: str | None) -> list[str]:
-    """Parse a comma-separated matched-ID cell. Empty cells become []."""
+def parse_matched_ids(raw: str | None, *, strict: bool = True) -> list[str]:
+    """Parse a comma-separated matched-ID cell. Empty cells become [].
+
+    When ``strict`` is True (default), reject IDs that are not S2-/S3-.
+    """
     if raw is None:
         return []
     text = str(raw).strip()
@@ -119,18 +130,26 @@ def parse_matched_ids(raw: str | None) -> list[str]:
     ordered: list[str] = []
     for part in text.split(","):
         entity_id = part.strip()
-        if entity_id and entity_id not in seen:
+        if not entity_id:
+            continue
+        if strict and not MATCH_ID_RE.match(entity_id):
+            raise GroundTruthError(f"Malformed matched entity id: {entity_id!r}")
+        if entity_id not in seen:
             seen.add(entity_id)
             ordered.append(entity_id)
     return ordered
 
 
-def ground_truth_to_sets(frame: pd.DataFrame) -> dict[str, set[str]]:
-    """Map each S1 ID to a set of true S2/S3 IDs."""
+def ground_truth_to_sets(frame: pd.DataFrame, *, strict: bool = True) -> dict[str, set[str]]:
+    """Map each S1 ID to a set of true S2/S3 IDs. Empty lists become set()."""
     mapping: dict[str, set[str]] = {}
     for row in frame.itertuples(index=False):
         s1 = str(row.source1_entity_id).strip()
-        mapping[s1] = set(parse_matched_ids(row.matched_entity_ids))
+        if strict and not S1_ID_RE.match(s1):
+            raise GroundTruthError(f"Malformed Source 1 id: {s1!r}")
+        if s1 in mapping:
+            raise GroundTruthError(f"Duplicate Source 1 id in ground truth: {s1}")
+        mapping[s1] = set(parse_matched_ids(row.matched_entity_ids, strict=strict))
     return mapping
 
 
@@ -160,7 +179,6 @@ def iter_source_chunks(
         na_filter=False,
         usecols=list(usecols) if usecols is not None else None,
         chunksize=chunksize,
-        engine="python",
     )
     for chunk in reader:
         if usecols is None:

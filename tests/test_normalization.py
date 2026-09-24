@@ -1,5 +1,6 @@
 from src.normalize import (
     address_views,
+    compact_alnum,
     name_views,
     normalize_address,
     normalize_ampersand,
@@ -35,6 +36,15 @@ def test_legal_suffix_representation() -> None:
     assert strip_legal_suffixes("Globex LLC") == "globex"
     # raw is untouched
     assert views.raw == "Globex Corporation"
+
+
+def test_unicode_and_compact_forms() -> None:
+    views = name_views("Café & Sons, Inc.")
+    assert views.unicode_normalized
+    assert "and" in views.ampersand_normalized
+    assert views.compact == compact_alnum("Café & Sons, Inc.")
+    assert views.without_legal_suffixes
+    assert views.raw == "Café & Sons, Inc."
 
 
 def test_address_views_numeric_tokens() -> None:
