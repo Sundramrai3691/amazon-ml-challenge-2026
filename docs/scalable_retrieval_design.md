@@ -130,24 +130,56 @@ smoke subset to within a documented delta before graduating.
 Stream Sx in 50 k-row chunks. Per view (name / address / combined):
 
 1. For each chunk, run `CountVectorizer(analyzer='char_wb',
-ngram_range=(3,5), lowercase=False)` with `vocabulary=None` to get per-chunk
-   term→document-frequency counts (document-frequency = fraction of docs that
-   contain the term; raw counts are aggregated per chunk into a global `df`
-   Counter keyed by ngram string).
-2. After the last chunk, keep the top `max_features` ngrams by **global
-   document-frequency descending** — this matches sklearn's documented
-   `max_features` selection rule exactly.
-3. Compute the smoothed IDF vector using sklearn's default formula:
-   `idf[t] = log((1 + N) / (1 + df[t])) + 1` where `N` = total rows seen in the
-   source.
-4. Persist `{vocabulary: {ngram: idx}, idf: np.ndarray, N_docs: int, analyzer,
-ngram_range, min_df, max_features}` to `artifacts/tfidf_vocab_{view}_{source}.json/npz`.
-5. Exact blocking indexes are built in the **same** streaming pass — when each
-   chunk is in memory compute the 6 exact keys and append to `BlockIndex` dicts.
+ngram_range=(3,5), lowercase=False)` with `vocabulary=None` and NO
+   `max_features` yet to obtain per-chunk sparse count matrix.
+2. Aggregate GLOBALLY across all chunks:
+   - `tf[t]` (global term-frequency counter): for each ngram string `t` in the
+     vocabulary, sum the column sums of each chunk's count matrix.
+   - `df[t]` (global document-frequency counter): for each chunk, compute
+     presence per ngram per document (`chunk_mat > 0` → `sum(axis=0)`), then
+     add that vector into the running global `df`.
+   - `N_docs`: running integer += chunk.shape[0] each iteration.
+3. After the last chunk:
+   - Apply `min_df` filter: drop all ngrams with `df[t] < min_df`.
+   - Keep the top `max_features` surviving ngrams by **global term-frequency
+     `tf[t]` descending**. Ties break by **ngram lexicographic ascending**
+     (matching `Counter.most_common` tie-break behavior as empirically
+     verified).
+   - Assign `vocabulary[t] = idx` in the preserved order.
+4. Compute the smoothed IDF vector using sklearn's formula:
+   `idf[t] = log((1 + N) / (1 + df[t])) + 1` where `N` = total rows seen in
+   the source.
+5. Persist `{vocabulary: {ngram: idx}, idf: np.ndarray, tf_sorted: [..],
+df_sorted: [..], N_docs: int, analyzer, ngram_range, min_df, max_features}`
+   to `artifacts/tfidf_vocab_{view}_{source}.npz/json`.
+6. Exact blocking indexes are built in the **same** streaming pass — when each
+   chunk is in memory compute the 6 exact keys and append to `BlockIndex`
+   dicts.
 
-**RAM of Phase 1:** bounded by chunk size (50 k rows × 3 views × 4 bytes per
-count ≈ a few MB) plus the final global Counter (~30 k ngrams × 8 bytes ≈
-0.24 MB). Effectively O(chunk_size + V).
+**Trade-off on vocabulary size / exactness.** Because `char_wb` over 3–5 gram
+can in principle produce up to (26+1+digits)^3 ≈ 29,800 distinct 3-grams and
+scales polynomially for 4,5-grams, the full-ngram-space Counter over a 1.2 M
+document source typically fits in RAM (<200 MB Python dict + numpy arrays for
+aggregated counts). If this is ever shown to be too large, the exact method
+requires a **two-pass deterministic alternative**:
+
+- Pass 1a: stream all chunks, run `CountVectorizer` per chunk, collect ALL
+  ngram keys seen, union them, write to a temporary sorted plain-text file of
+  keys, dedupe by line sort (`sort -u` equivalent — use Python `sorted(set())`
+  if fits, otherwise external sort via disk `heapq.merge` of chunk-keyed
+  lists).
+- Pass 1b: re-scan with the FULL fixed key list as vocabulary of size
+  `V_potential`, accumulate global `tf` and `df` exactly, then apply `min_df` +
+  `max_features` by tf descending as before. This trades 1 extra source pass
+  for exact counting with bounded RAM O(V_potential_per_chunk); we will adopt
+  it only if the single-pass Counter approach is empirically shown to exceed
+  250 MB peak. For the current design we start with single-pass counting.
+
+**RAM of Phase 1:** bounded by chunk size (50 k rows × 3 views × sparse mat ≈
+a few hundred MB) plus the final global aggregated arrays (~V=30,000 after
+min_df + max_features → ~0.5 MB for int32 arrays; the intermediate pre-filter
+Counters for raw ngrams are the hot path, estimated < 200 MB peak for 1.2 M
+documents).
 
 ### Phase 2 — Streaming transform + per-S1 top-K heaps (1 scan per source)
 
@@ -197,22 +229,26 @@ Replace the full candidate list with bounded heaps:
 
 ### Sklearn equivalence proof (Approach B vs A)
 
-| sklearn detail                            | Approach B matches?                                                                                             |
-| ----------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
-| `analyzer='char_wb'`                      | Yes, same CountVectorizer per chunk.                                                                            |
-| `ngram_range=(3,5)`                       | Yes.                                                                                                            |
-| `min_df=2` global                         | Yes — after Phase 1 global df, remove vocab entries with df < min_df before idf.                                |
-| `max_features` selection rule             | Yes — top V by global document-frequency descending. Same tie-break by ngram lex order to remove any ambiguity. |
-| `smooth_idf=True` (default)               | Yes, same formula: `log((1+N)/(1+df)) + 1`. Verified vs sklearn source.                                         |
-| `sublinear_tf=False` (default)            | Yes, raw TF counts not log-scaled.                                                                              |
-| L2 row normalization applied after TF-IDF | Yes, scipy `normalize(norm='l2')` applied after IDF multiply.                                                   |
-| Cosine similarity                         | Yes = normalized dot product of two L2-normalized vectors.                                                      |
-| Top-K selection by similarity             | Yes, heap-based same-tie-break keeps ordering identical.                                                        |
+| sklearn detail                            | Approach B matches?                                                                                                                                                                 |
+| ----------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `analyzer='char_wb'`                      | Yes, same CountVectorizer per chunk.                                                                                                                                                |
+| `ngram_range=(3,5)`                       | Yes.                                                                                                                                                                                |
+| `min_df=2` global                         | Yes — after Phase 1 global df aggregated across all chunks, remove vocab entries with df < min_df BEFORE idf computation.                                                           |
+| `max_features` selection rule             | Yes — top V by **global term-frequency `tf[t]`** descending (documented above as empirically verified against sklearn). Tie-break: ngram lex ascending (Counter.most_common style). |
+| `smooth_idf=True` (default)               | Yes, same formula: `log((1+N)/(1+df)) + 1`. Verified vs sklearn source on 2 synthetic corpora.                                                                                      |
+| `sublinear_tf=False` (default)            | Yes, raw TF counts not log-scaled.                                                                                                                                                  |
+| `use_idf=True`                            | Yes, idf multiplication happens before normalization.                                                                                                                               |
+| L2 row normalization applied after TF-IDF | Yes, scipy `normalize(norm='l2')` applied after IDF multiply. Identical semantics; zero rows remain zero rows.                                                                      |
+| Cosine similarity                         | Yes = normalized dot product of two L2-normalized vectors.                                                                                                                          |
+| Top-K selection by similarity             | Yes, heap-based same-tie-break keeps ordering identical: equal sims break by candidate_id lex ascending to match deterministic `np.argsort` on equal floats.                        |
 
 Minor difference that does **not** affect candidate selection: if two candidates
 tie on similarity to the 10th decimal, the chunk processing order in B may
-break the tie differently than A's within-chunk argpartition. A fixed tie-break
-keyed on candidate_id removes this.
+break the tie differently than A's within-chunk argpartition unless we add the
+explicit `(sim, -id_ord, cand_id)` heap key. We therefore enforce a
+deterministic tie-break: for equal similarity, prefer the candidate with the
+**lexicographically smaller** entity ID. This behavior must match the
+`_sparse_topk` refactored tie-break used as the oracle in Approach A.
 
 ### Full-scale estimates for Approach B
 
@@ -324,16 +360,16 @@ Implement after B is validated, only if code clarity warrants the extra file.
 
 ## 6. Decision table and migration plan
 
-| #   | Item                                                                                                                                                                                                                                                                       | Owner / status |
-| --- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------- |
-| 1   | **Approach B selected** as the full-scale retrieval target.                                                                                                                                                                                                                | Design done.   |
-| 2   | Approach A remains the smoke oracle; no removal until 100% set-equality on smoke.                                                                                                                                                                                          | Later.         |
-| 3   | Approach D (estimator wrapper) is deferred to cleanup after B lands.                                                                                                                                                                                                       | Deferred.      |
-| 4   | Approach C (inverted postings) deferred. Documented only for the record.                                                                                                                                                                                                   | Deferred.      |
-| 5   | First implementation step: add `build_fixed_vocabulary(source_iterable, *, analyzer, ngram_range, min_df, max_features) -> (vocab, idf_arr, N_docs)` to `blocking.py` + tests that assert vocabulary equals sklearn TfidfVectorizer on a 5 k-row synthetic corpus.         | Not done.      |
-| 6   | Second step: add `streaming_char_tfidf_candidates(source_iterable, s1_queries_by_view, *, vocab, idf, k, s1_ids, method_name) -> (candidates, meta)` that uses chunked transform + per-S1 heaps, passes the same smoke unit tests that `char_tfidf_candidates` does today. | Not done.      |
-| 7   | Third step: wrap the exact-blocking build in a streaming pass so the BlockIndexes are built during vocab scan without re-reading S2/S3.                                                                                                                                    | Not done.      |
-| 8   | Fourth step: verify 100% candidate set overlap + 99.9% channel flag agreement A vs B on smoke with identical seeds.                                                                                                                                                        | Not done.      |
+| #   | Item                                                                                                                                                                                                                                                                                                                                                                                                     | Owner / status |
+| --- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------- |
+| 1   | **Approach B selected** as the full-scale retrieval target.                                                                                                                                                                                                                                                                                                                                              | Design done.   |
+| 2   | Approach A remains the smoke oracle; no removal until 100% set-equality on smoke.                                                                                                                                                                                                                                                                                                                        | Later.         |
+| 3   | Approach D (estimator wrapper) is deferred to cleanup after B lands.                                                                                                                                                                                                                                                                                                                                     | Deferred.      |
+| 4   | Approach C (inverted postings) deferred. Documented only for the record.                                                                                                                                                                                                                                                                                                                                 | Deferred.      |
+| 5   | First implementation step: add `build_fixed_vocabulary(text_chunk_iterable, *, analyzer, ngram_range, min_df, max_features) -> VocabBuildResult(vocabulary, idf_arr, tf_arr, df_arr, N_docs)` to `src/streaming_tfidf.py` + tests that assert vocabulary equals sklearn TfidfVectorizer on a 5 k-row synthetic corpus (covering rare/bursty, singleton, tie, and min_df/max_features boundary cases).    | Not done.      |
+| 6   | Second step: add `CharTFIDFStreamingRetriever(vocab, idf, k, method_name, analyzer='char_wb', ngram_range=(3,5))` class with: `partial_fit_source_chunk(texts, entity_ids)` (builds source chunk tf-idf + merges per-S1 top-K heaps) and `finalize_candidates(s1_ids) -> (CandidateMap, PairMeta)`. Passes the same smoke unit tests that `char_tfidf_candidates` does today against the sklearn oracle. | Not done.      |
+| 7   | Third step: wrap the exact-blocking build in a streaming pass so the BlockIndexes are built during vocab scan without re-reading S2/S3.                                                                                                                                                                                                                                                                  | Not done.      |
+| 8   | Fourth step: verify 100% candidate set overlap + 99.9% channel flag agreement A vs B on smoke with identical seeds.                                                                                                                                                                                                                                                                                      | Not done.      |
 
 ## 7. What explicitly this design does NOT change
 
