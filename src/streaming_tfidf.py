@@ -32,9 +32,11 @@ PairMeta = dict[tuple[str, str], dict[str, object]]
 class VocabBuildResult:
     """Output of :func:`build_fixed_vocabulary`.
 
-    The ngram -> index mapping has deterministic order: max_features
-    descending by global term frequency; ties broken by ngram
-    lexicographic ascending (matching ``Counter.most_common``).
+    The ngram -> index mapping replicates sklearn's exact feature
+    selection: features are sorted alphabetically (matching sklearn's
+    ``_sort_features``), then ``max_features`` selects via
+    ``(-tfs).argsort()[:max_features]`` (matching sklearn's
+    ``_limit_features``). Final vocabulary order is alphabetical.
     """
 
     vocabulary: dict[str, int]
@@ -78,9 +80,10 @@ def build_fixed_vocabulary(
     - per-chunk ``CountVectorizer`` aggregates **global term-frequency** and
       **global document-frequency** counts; no intermediate approximations.
     - ``min_df`` filtering happens BEFORE the top-``max_features`` selection.
-    - ``max_features`` keeps the top-V features by **global term frequency**
-      descending; ties are broken by **ngram string lexicographic ascending**
-      order (verified against sklearn).
+    - ``max_features`` selection replicates sklearn's ``_limit_features``
+      exactly: features are sorted alphabetically (matching ``_sort_features``),
+      then ``(-tfs).argsort()[:max_features]`` selects the top-V (matching
+      sklearn v1.9.1 default quicksort tie-breaking).
     - Smoothed idf: ``log((1 + N) / (1 + df)) + 1``.
 
     Parameters
@@ -133,10 +136,16 @@ def build_fixed_vocabulary(
     else:
         surviving = list(tf_counter.items())
 
-    # 2) max_features: top-V by tf desc, ties by ngram asc (Counter.most_common() style)
-    surviving.sort(key=lambda kv: (-kv[1], kv[0]))
+    # 2) max_features: replicate sklearn's _limit_features exactly.
+    #    sklearn._sort_features puts features in alphabetical order, then
+    #    _limit_features does: mask_inds = (-tfs[mask]).argsort()[:limit]
+    #    with default numpy quicksort (not stable). We replicate this.
+    surviving.sort(key=lambda kv: kv[0])  # alphabetical, matching _sort_features
     if max_features and max_features > 0 and len(surviving) > max_features:
-        surviving = surviving[:max_features]
+        tfs_arr = np.array([tf for _, tf in surviving], dtype=np.int64)
+        keep_inds = (-tfs_arr).argsort()[:max_features]
+        keep_set = set(keep_inds.tolist())
+        surviving = [surviving[i] for i in range(len(surviving)) if i in keep_set]
 
     if surviving:
         ngrams_sorted = [ng for ng, _ in surviving]

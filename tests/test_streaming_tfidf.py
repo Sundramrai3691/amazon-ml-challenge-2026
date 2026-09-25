@@ -234,6 +234,38 @@ class TestBuildFixedVocabulary:
         # 4) N_docs
         assert result.N_docs == len(docs)
 
+    def test_maxfeatures_boundary_truncation_matches_sklearn(self):
+        """When max_features truncates at a tied-tf boundary, selected features
+        must match sklearn exactly. This is the scenario that caused the A/B
+        real-data recall difference (914/20000 features diverged).
+
+        We create a corpus with many 3-grams at the same term frequency,
+        set max_features to force truncation within the tied group, and
+        verify exact set equality with sklearn.
+        """
+        rng = np.random.RandomState(99)
+        # Many unique tokens → many char 3-grams with similar tf
+        tokens = ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot",
+                  "golf", "hotel", "india", "juliet", "kilo", "lima",
+                  "mike", "november", "oscar", "papa", "quebec", "romeo",
+                  "sierra", "tango", "uniform", "victor", "whiskey", "xray",
+                  "yankee", "zulu"]
+        docs = [" ".join(rng.choice(tokens, size=8)) for _ in range(100)]
+        # Use max_features much smaller than total unique 3-grams to force
+        # boundary truncation within tied-tf groups
+        params = dict(analyzer="char_wb", ngram_range=(3, 4), min_df=1,
+                      max_features=30, lowercase=False)
+        result = build_fixed_vocabulary([docs], **params)
+        skl, _ = _sklearn_oracle_tfidf_vectorizer(docs, **params)
+
+        our_set = set(result.vocabulary.keys())
+        skl_set = set(skl.vocabulary_.keys())
+        assert our_set == skl_set, (
+            f"max_features boundary mismatch: "
+            f"|ours|={len(our_set)}, |skl|={len(skl_set)}, "
+            f"ours_only={our_set - skl_set}, skl_only={skl_set - our_set}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # 2. TF-IDF numerical equivalence vs sklearn
