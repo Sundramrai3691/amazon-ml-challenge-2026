@@ -20,7 +20,7 @@ from src.blocking import (
     generate_exact_candidates,
     union_exact_with_tfidf_k,
 )
-from src.error_analysis import analyze_errors, render_error_markdown
+from src.error_analysis import analyze_errors, render_error_markdown, retrieval_channel_contribution
 from src.experiment_log import append_experiment
 from src.features import FEATURE_NAMES, fit_rarity_stats, feature_matrix, records_by_id
 from src.load_data import (
@@ -75,6 +75,7 @@ def run_baseline(
     loader_precheck_only: bool = False,
 ) -> dict[str, Any]:
     started = time.perf_counter()
+    stage_times: dict[str, float] = {}
     seed = int(config.get("seed", 42))
     train_dir = repo / config["paths"]["train_dir"]
     train_p = Path(train_dir)
@@ -84,6 +85,7 @@ def run_baseline(
     )
     loader_diagnostics: dict[str, Any] = {}
 
+    t0_load = time.perf_counter()
     if smoke_mode:
         s1_full = load_source1(train_p / TRAIN_FILENAMES["source1"])
         s1_ids_all = [str(x) for x in s1_full["entity_id"].tolist()]
@@ -168,10 +170,13 @@ def run_baseline(
             s1 = _filter(s1, set(s1_ids_selected))
             gt_all = {k: gt_all.get(k, set()) for k in s1_ids_selected}
 
+    stage_times["loading"] = time.perf_counter() - t0_load
+
     if loader_precheck_only:
         return {
             "loader_precheck_only": True,
             "runtime_seconds": time.perf_counter() - started,
+            "stage_times": stage_times,
             "n_s1": len(s1),
             "n_s2": len(s2),
             "n_s3": len(s3),
@@ -222,10 +227,15 @@ def run_baseline(
     else:
         effective_max_features = int(tfidf_cfg.get("max_features", 50000))
     use_tfidf = bool(tfidf_cfg.get("enabled", True)) and not skip_tfidf
+    tfidf_dtype = "float32"
 
+    t0_exact = time.perf_counter()
     exact_val, _exact_val_meta = generate_exact_candidates(
         val_s1, s2, s3, methods=exact_methods, max_candidates_per_s1=None
     )
+    stage_times["exact_blocking"] = time.perf_counter() - t0_exact
+
+    t0_tfidf = time.perf_counter()
     val_pool, val_meta, tfidf_runtime = generate_candidate_pool(
         val_s1,
         s2,
@@ -238,7 +248,10 @@ def run_baseline(
         min_df=int(tfidf_cfg.get("min_df", 2)),
         max_features=effective_max_features,
     )
+    stage_times["tfidf"] = time.perf_counter() - t0_tfidf
     s1_records = records_by_id(s1)
+
+    t0_union = time.perf_counter()
     recall_by_k = {}
     tfidf_runtime_total = float(sum(tfidf_runtime.values())) if tfidf_runtime else 0.0
     for k in k_grid:
@@ -272,7 +285,9 @@ def run_baseline(
         max_features=effective_max_features,
     )
     train_pool = cap_preferring_exact(train_pool, train_meta, max_cands)
+    stage_times["candidate_union_and_recall"] = time.perf_counter() - t0_union
 
+    t0_feat = time.perf_counter()
     rarity = fit_rarity_stats([train_s1, s2, s3])
     pairs, y, pair_stats = build_pair_labels(train_pool, gt_train)
     sample_cfg = config.get("sampling", {})
@@ -285,6 +300,9 @@ def run_baseline(
     cand_records = records_by_id(s2)
     cand_records.update(records_by_id(s3))
     X_train = feature_matrix(pairs, s1_records, cand_records, train_meta, rarity=rarity)
+    stage_times["feature_generation"] = time.perf_counter() - t0_feat
+
+    t0_train = time.perf_counter()
     model_cfg = config.get("model", {})
     model = make_model(model_cfg.get("type", "gbdt"), **(model_cfg.get("params") or {}))
     if len(y) == 0:
@@ -296,7 +314,9 @@ def run_baseline(
         models_dir / "baseline_gbdt.joblib",
         feature_names=list(X_train.columns) if len(X_train.columns) else list(FEATURE_NAMES),
     )
+    stage_times["model_training"] = time.perf_counter() - t0_train
 
+    t0_thresh = time.perf_counter()
     val_pairs = [(s1, cand) for s1, cands in val_candidates.items() for cand in cands]
     X_val = feature_matrix(val_pairs, s1_records, cand_records, val_meta, rarity=rarity)
     scores = score_pairs(model, X_val.to_numpy(dtype=float)) if len(val_pairs) else []
@@ -304,7 +324,9 @@ def run_baseline(
     sweep = sweep_thresholds(val_pairs, scores, gt_val, grid, s1_ids=val_ids)
     best = best_threshold_row(sweep) if sweep else {"threshold": 0.7, "macro_f0_5": 0.0}
     preds = apply_threshold(val_pairs, scores, threshold=float(best["threshold"]), s1_ids=val_ids)
+    stage_times["threshold_evaluation"] = time.perf_counter() - t0_thresh
 
+    t0_sub = time.perf_counter()
     errors = analyze_errors(
         gt_val,
         preds,
@@ -319,9 +341,28 @@ def run_baseline(
     err_path = repo / "docs" / "baseline_error_analysis.md"
     err_path.write_text(render_error_markdown(errors), encoding="utf-8")
 
+    submission_paths: dict[str, str] = {}
     if write_val_submission:
         out_dir = repo / config["paths"]["output_dir"]
-        write_submission(val_ids, val_candidates, preds, out_dir)
+        match_path, cand_path = write_submission(val_ids, val_candidates, preds, out_dir)
+        submission_paths["matching_results"] = str(match_path)
+        submission_paths["candidate_pairs"] = str(cand_path)
+
+    retrieval_channel_path: str | None = None
+    try:
+        rcc = retrieval_channel_contribution(
+            ground_truth=gt_val,
+            candidates=val_candidates,
+            pair_meta=val_meta,
+            label="SMOKE_TEST_NON_COMPARABLE" if smoke_mode else "NORMAL_BASELINE",
+        )
+        rcc_path = repo / "artifacts" / "retrieval_channel_contribution.json"
+        rcc_path.write_text(json.dumps(rcc, default=str, indent=2), encoding="utf-8")
+        retrieval_channel_path = str(rcc_path)
+    except Exception:  # noqa: BLE001 — diagnostics must never crash the pipeline
+        rcc = {"error": "retrieval_channel_contribution computation failed"}
+
+    stage_times["submission_and_error_analysis"] = time.perf_counter() - t0_sub
 
     runtime = time.perf_counter() - started
     result = {
@@ -330,20 +371,37 @@ def run_baseline(
         "val_recall": val_recall,
         "recall_by_k": recall_by_k,
         "tfidf_runtime": tfidf_runtime,
+        "tfidf_config": {
+            "k_grid": k_grid,
+            "k_final": k_final,
+            "max_features": effective_max_features,
+            "ngram_range": tuple(tfidf_cfg.get("ngram_range", [3, 5])),
+            "min_df": int(tfidf_cfg.get("min_df", 2)),
+            "dtype": tfidf_dtype,
+            "analyzer": tfidf_cfg.get("analyzer", "char_wb"),
+            "enabled": use_tfidf,
+        },
         "best_threshold": best,
         "runtime_seconds": runtime,
+        "stage_times": stage_times,
         "n_train_s1": len(train_ids),
         "n_val_s1": len(val_ids),
+        "n_s2": len(s2),
+        "n_s3": len(s3),
         "n_train_pairs": int(len(y)),
         "feature_names": list(X_train.columns),
         "loader_diagnostics": loader_diagnostics,
+        "submission_paths": submission_paths,
+        "label": "SMOKE_TEST_NON_COMPARABLE" if smoke_mode else "NORMAL_BASELINE",
+        "retrieval_channel_contribution": rcc,
+        "retrieval_channel_contribution_path": retrieval_channel_path,
     }
     (repo / "artifacts" / "baseline_last.json").write_text(json.dumps(result, default=str, indent=2), encoding="utf-8")
     append_experiment(
         repo / "experiments" / "experiment_log.csv",
         {
-            "experiment_id": "E0-E5-baseline",
-            "description": "Entity-level GBDT baseline",
+            "experiment_id": "E0-E5-baseline" + ("_SMOKE_TEST_NON_COMPARABLE" if smoke_mode else ""),
+            "description": "Entity-level GBDT baseline" + (" (SMOKE_TEST_NON_COMPARABLE)" if smoke_mode else ""),
             "hypothesis": "Exact blocking union char TF-IDF plus GBDT and threshold sweep beats a naive 0.5 cutoff",
             "dataset_version": "challenge_train",
             "validation_split_seed": seed,
@@ -364,7 +422,12 @@ def run_baseline(
             "macro_f05": best.get("macro_f0_5"),
             "threshold": best.get("threshold"),
             "runtime_seconds": runtime,
-            "notes": f"limit_s1={limit_s1}; limit_s2={limit_s2}; limit_s3={limit_s3}; skip_tfidf={skip_tfidf}; smoke_kgrid={smoke_kgrid}; smoke_max_features={smoke_max_features}",
+            "notes": (
+                f"limit_s1={limit_s1}; limit_s2={limit_s2}; limit_s3={limit_s3}; "
+                f"skip_tfidf={skip_tfidf}; smoke_kgrid={smoke_kgrid}; "
+                f"smoke_max_features={smoke_max_features}; "
+                f"label={'SMOKE_TEST_NON_COMPARABLE' if smoke_mode else 'NORMAL_BASELINE'}"
+            ),
         },
     )
     return result

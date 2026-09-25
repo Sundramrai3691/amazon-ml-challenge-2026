@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from typing import Iterable, Mapping, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 from src.features import pair_feature_dict
 
@@ -154,3 +154,122 @@ def render_error_markdown(report: Mapping[str, object]) -> str:
                 lines.append(f"  - `{ex}`")
         lines.append("")
     return "\n".join(lines) + "\n"
+
+
+EXACT_FLAGS = ("retrieved_by_exact_name", "retrieved_by_exact_address")
+TFIDF_FLAGS = ("retrieved_by_char_name", "retrieved_by_char_address", "retrieved_by_char_combined")
+ALL_CHANNEL_FLAGS = EXACT_FLAGS + TFIDF_FLAGS
+
+
+def _flag(meta_row: Mapping[str, Any] | None, key: str) -> bool:
+    if meta_row is None:
+        return False
+    val = meta_row.get(key)
+    try:
+        return bool(int(val))
+    except (TypeError, ValueError):
+        return False
+
+
+def retrieval_channel_contribution(
+    *,
+    ground_truth: Mapping[str, Iterable[str]],
+    candidates: Mapping[str, Iterable[str]],
+    pair_meta: Mapping[tuple[str, str], Mapping[str, object]] | None = None,
+    label: str = "",
+) -> dict[str, Any]:
+    """True-positive retrieval-channel breakdown for diagnostic artifacts.
+
+    Aggregates over ground truth pairs only (not negatives).
+    Results are meant to be persisted as ``retrieval_channel_contribution.json``
+    so future runs don't need to recompute from in-memory pair_meta.
+
+    Any pair not in ``candidates`` counts as ``missed_by_both``.  If pair_meta
+    is missing for a retrieved pair (should not happen), flags conservatively
+    become ``unknown``.
+    """
+    pair_meta = pair_meta or {}
+
+    total_gt_pairs = 0
+    recovered_exact_union = 0
+    recovered_tfidf_union = 0
+    recovered_both = 0
+    recovered_either = 0
+    missed_by_both = 0
+
+    exact_only_tp = 0
+    tfidf_only_tp = 0
+    both_exact_and_tfidf_tp = 0
+    unknown_retrieval_tp = 0
+
+    char_name_tp = 0
+    char_address_tp = 0
+    char_combined_tp = 0
+
+    missed_by_both_examples: list[dict[str, Any]] = []
+
+    for s1, true_ids in ground_truth.items():
+        cand_set = _set(candidates.get(s1, ()))
+        for mid in _set(true_ids):
+            total_gt_pairs += 1
+            if mid not in cand_set:
+                missed_by_both += 1
+                if len(missed_by_both_examples) < 50:
+                    missed_by_both_examples.append(
+                        {
+                            "s1": s1,
+                            "id": mid,
+                            "in_candidates": False,
+                            "retrieval_meta_available": False,
+                            "flags": {},
+                        }
+                    )
+                continue
+            recovered_either += 1
+            meta = pair_meta.get((s1, mid))
+            exact_hit = any(_flag(meta, f) for f in EXACT_FLAGS)
+            tfidf_hit = any(_flag(meta, f) for f in TFIDF_FLAGS)
+            if exact_hit:
+                recovered_exact_union += 1
+            if tfidf_hit:
+                recovered_tfidf_union += 1
+            if exact_hit and tfidf_hit:
+                recovered_both += 1
+                both_exact_and_tfidf_tp += 1
+            elif exact_hit:
+                exact_only_tp += 1
+            elif tfidf_hit:
+                tfidf_only_tp += 1
+            else:
+                unknown_retrieval_tp += 1
+
+            if _flag(meta, "retrieved_by_char_name"):
+                char_name_tp += 1
+            if _flag(meta, "retrieved_by_char_address"):
+                char_address_tp += 1
+            if _flag(meta, "retrieved_by_char_combined"):
+                char_combined_tp += 1
+
+    return {
+        "label": label,
+        "totals": {
+            "total_gt_pairs": total_gt_pairs,
+            "recovered_either": recovered_either,
+            "recovered_by_exact_union": recovered_exact_union,
+            "recovered_by_tfidf_union": recovered_tfidf_union,
+            "recovered_by_both_exact_and_tfidf": recovered_both,
+            "missed_by_both": missed_by_both,
+        },
+        "tp_recovery_breakdown": {
+            "exact_only": exact_only_tp,
+            "tfidf_only": tfidf_only_tp,
+            "both_exact_and_tfidf": both_exact_and_tfidf_tp,
+            "unknown_retrieval_path": unknown_retrieval_tp,
+        },
+        "tfidf_channel_breakdown": {
+            "char_name_tp": char_name_tp,
+            "char_address_tp": char_address_tp,
+            "char_combined_tp": char_combined_tp,
+        },
+        "missed_by_both_examples": missed_by_both_examples,
+    }
