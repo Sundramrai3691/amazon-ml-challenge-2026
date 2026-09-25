@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
+import math
 
 import joblib
 import numpy as np
@@ -66,9 +67,43 @@ def build_pair_labels(
     return pairs, y, stats
 
 
-def make_model(model_type: str = "logistic_regression", **params: Any) -> ClassifierMixin:
-    """Config-driven sklearn-compatible classifier. No pretrained downloads."""
+def make_model(model_type: str = "gbdt", **params: Any) -> ClassifierMixin:
+    """Config-driven classifier. Prefers LightGBM; sklearn HGB is the fallback."""
     model_type = model_type.lower()
+    if model_type in {"gbdt", "lightgbm", "lgbm", "hist_gbdt"}:
+        try:
+            from lightgbm import LGBMClassifier
+
+            defaults: dict[str, Any] = {
+                "n_estimators": 200,
+                "learning_rate": 0.05,
+                "num_leaves": 31,
+                "subsample": 0.8,
+                "colsample_bytree": 0.8,
+                "random_state": 42,
+                "n_jobs": 1,
+                "verbose": -1,
+            }
+            defaults.update(params)
+            return LGBMClassifier(**defaults)
+        except ImportError:
+            from sklearn.ensemble import HistGradientBoostingClassifier
+
+            defaults = {
+                "max_depth": 6,
+                "learning_rate": 0.08,
+                "max_iter": 150,
+                "random_state": 42,
+                "verbose": 0,
+            }
+            defaults.update(params)
+            defaults.pop("n_estimators", None)
+            defaults.pop("num_leaves", None)
+            defaults.pop("subsample", None)
+            defaults.pop("colsample_bytree", None)
+            defaults.pop("n_jobs", None)
+            defaults.pop("verbose", None)
+            return HistGradientBoostingClassifier(**defaults)
     if model_type in {"logistic_regression", "logreg", "lr"}:
         defaults = {"C": 1.0, "class_weight": "balanced", "max_iter": 1000, "solver": "lbfgs"}
         defaults.update(params)
@@ -77,11 +112,7 @@ def make_model(model_type: str = "logistic_regression", **params: Any) -> Classi
         defaults = {"class_weight": "balanced", "random_state": 42, "max_depth": 8}
         defaults.update(params)
         return DecisionTreeClassifier(**defaults)
-    raise ValueError(
-        f"Unknown model type {model_type!r}. "
-        "Supported now: logistic_regression, decision_tree. "
-        "Add LightGBM/XGBoost later only if experiments justify them."
-    )
+    raise ValueError(f"Unknown model type {model_type!r}.")
 
 
 def fit_pair_model(
@@ -128,6 +159,29 @@ def load_model(path: str | Path) -> tuple[ClassifierMixin, list[str]]:
     return payload, list(BASELINE_FEATURE_NAMES)
 
 
+def downsample_negatives(
+    pairs: Sequence[Pair],
+    y: np.ndarray,
+    *,
+    max_neg_per_pos: float | None,
+    seed: int,
+) -> tuple[list[Pair], np.ndarray]:
+    """Optional deterministic negative downsampling. Positives are always kept."""
+    if max_neg_per_pos is None or max_neg_per_pos <= 0:
+        return list(pairs), y
+    pos_idx = [i for i, label in enumerate(y) if label == 1]
+    neg_idx = [i for i, label in enumerate(y) if label == 0]
+    n_keep = int(math.ceil(len(pos_idx) * max_neg_per_pos)) if pos_idx else len(neg_idx)
+    n_keep = min(n_keep, len(neg_idx))
+    rng = np.random.RandomState(seed)
+    if n_keep < len(neg_idx):
+        chosen = rng.choice(neg_idx, size=n_keep, replace=False)
+        keep = sorted(pos_idx + list(chosen.tolist()))
+    else:
+        keep = list(range(len(y)))
+    return [pairs[i] for i in keep], y[keep]
+
+
 def build_training_matrix(
     candidates: Mapping[str, Iterable[str]],
     ground_truth_frame_or_map: Any,
@@ -135,18 +189,28 @@ def build_training_matrix(
     s2_frame: Any,
     s3_frame: Any,
     pair_meta: Mapping[tuple[str, str], Mapping[str, object]] | None = None,
+    rarity=None,
+    *,
+    max_neg_per_pos: float | None = None,
+    seed: int = 42,
 ):
-    """Convenience: labels + features from candidates (hard negatives only)."""
+    """Labels + features from candidates (hard negatives only)."""
     if hasattr(ground_truth_frame_or_map, "columns"):
         gt = ground_truth_to_sets(ground_truth_frame_or_map)
     else:
         gt = {k: set(v) for k, v in ground_truth_frame_or_map.items()}
     pairs, y, stats = build_pair_labels(candidates, gt)
+    pairs, y = downsample_negatives(pairs, y, max_neg_per_pos=max_neg_per_pos, seed=seed)
     s1_records = records_by_id(s1_frame)
     cand_records = records_by_id(s2_frame)
     cand_records.update(records_by_id(s3_frame))
-    X_df = feature_matrix(pairs, s1_records, cand_records, pair_meta)
-    return X_df, y, pairs, stats
+    X_df = feature_matrix(pairs, s1_records, cand_records, pair_meta, rarity=rarity)
+    ratio = (stats.positives / stats.negatives) if stats.negatives else float("inf")
+    extra = {
+        "positive_negative_ratio": ratio,
+        "n_pairs_after_sampling": int(len(y)),
+    }
+    return X_df, y, pairs, stats, extra
 
 
 # Extension points for later experiments (documented, unused now):
