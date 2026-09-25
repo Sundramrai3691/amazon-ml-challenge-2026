@@ -586,3 +586,64 @@ def evaluate_candidate_recall(
     for key, vals in by_name_len.items():
         out[f"recall_name_{key}"] = _mean(vals)
     return out
+
+
+def evaluate_candidate_recall_per_source(
+    candidates: Mapping[str, Iterable[str]],
+    ground_truth: Mapping[str, Iterable[str]],
+    *,
+    n_s2: int | None = None,
+    n_s3: int | None = None,
+    s1_records: Mapping[str, Mapping[str, object]] | None = None,
+) -> dict[str, object]:
+    """Evaluate candidate recall split by combined / S2-only / S3-only.
+
+    The top-level combined metric uses ``evaluate_candidate_recall``.
+    Source-specific variants filter the ground truth to S2 or S3 IDs only
+    and count matches against that subset. Empty subsets after filtering
+    produce NaN recall (per-source recall is only meaningful for S1 entities
+    that actually have a true match of that source).
+    """
+
+    def _filter_gt(prefix: str) -> dict[str, set[str]]:
+        out: dict[str, set[str]] = {}
+        for s1, true_ids in ground_truth.items():
+            out[s1] = {mid for mid in true_ids if str(mid).startswith(prefix)}
+        return out
+
+    combined = evaluate_candidate_recall(
+        candidates,
+        ground_truth,
+        n_s2=n_s2,
+        n_s3=n_s3,
+        s1_records=s1_records,
+    )
+    gt_s2 = _filter_gt("S2-")
+    gt_s3 = _filter_gt("S3-")
+
+    def _recall_subset(gt_subset: Mapping[str, Iterable[str]]) -> float:
+        per_s1: list[float] = []
+        for s1, true_ids in gt_subset.items():
+            true_set = set(true_ids)
+            if not true_set:
+                continue
+            cand_set = set(candidates.get(s1, []))
+            if not cand_set:
+                per_s1.append(0.0)
+                continue
+            per_s1.append(len(true_set & cand_set) / len(true_set))
+        return float(np.mean(per_s1)) if per_s1 else float("nan")
+
+    return {
+        "candidate_recall_combined": combined["candidate_recall"],
+        "candidate_recall_s2": _recall_subset(gt_s2),
+        "candidate_recall_s3": _recall_subset(gt_s3),
+        "average_candidates_per_s1": combined["average_candidates_per_s1"],
+        "median_candidates_per_s1": combined["median_candidates_per_s1"],
+        "p95_candidates_per_s1": combined["p95_candidates_per_s1"],
+        "p99_candidates_per_s1": combined["p99_candidates_per_s1"],
+        "max_candidates_per_s1": combined["max_candidates_per_s1"],
+        "reduction_ratio": combined["reduction_ratio"],
+        "n_s1": combined["n_s1"],
+        "singleton_candidate_rate": combined["singleton_candidate_rate"],
+    }

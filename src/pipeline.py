@@ -15,6 +15,7 @@ from src.audit import render_audit_markdown, run_full_audit
 from src.blocking import (
     cap_preferring_exact,
     evaluate_candidate_recall,
+    evaluate_candidate_recall_per_source,
     generate_candidate_pool,
     generate_exact_candidates,
     union_exact_with_tfidf_k,
@@ -110,17 +111,20 @@ def run_baseline(
         use_char_tfidf=use_tfidf,
         max_candidates_per_s1=None,
         ngram_range=tuple(tfidf_cfg.get("ngram_range", [3, 5])),
-        min_df=int(tfidf_cfg.get("min_df", 1)),
+        min_df=int(tfidf_cfg.get("min_df", 2)),
         max_features=int(tfidf_cfg.get("max_features", 50000)),
     )
     s1_records = records_by_id(s1)
     recall_by_k = {}
+    tfidf_runtime_total = float(sum(tfidf_runtime.values())) if tfidf_runtime else 0.0
     for k in k_grid:
         mixed = union_exact_with_tfidf_k(exact_val, val_pool, val_meta, k if use_tfidf else 0)
         capped = cap_preferring_exact(mixed, val_meta, max_cands)
-        recall_by_k[str(k)] = evaluate_candidate_recall(
+        per_source = evaluate_candidate_recall_per_source(
             capped, gt_val, n_s2=len(s2), n_s3=len(s3), s1_records=s1_records
         )
+        per_source["tfidf_runtime_seconds"] = tfidf_runtime_total
+        recall_by_k[str(k)] = per_source
 
     val_candidates = cap_preferring_exact(
         union_exact_with_tfidf_k(exact_val, val_pool, val_meta, k_final if use_tfidf else 0),
@@ -140,7 +144,7 @@ def run_baseline(
         use_char_tfidf=use_tfidf,
         max_candidates_per_s1=None,
         ngram_range=tuple(tfidf_cfg.get("ngram_range", [3, 5])),
-        min_df=int(tfidf_cfg.get("min_df", 1)),
+        min_df=int(tfidf_cfg.get("min_df", 2)),
         max_features=int(tfidf_cfg.get("max_features", 50000)),
     )
     train_pool = cap_preferring_exact(train_pool, train_meta, max_cands)
