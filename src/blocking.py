@@ -320,6 +320,7 @@ def char_tfidf_candidates(
         min_df=min_df,
         max_features=max_features,
         lowercase=False,
+        dtype=np.float32,
     )
     index_mat = vectorizer.fit_transform(_field_texts(pool, field))
     query_mat = vectorizer.transform(_field_texts(source1, field))

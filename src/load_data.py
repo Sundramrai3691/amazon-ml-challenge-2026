@@ -6,9 +6,11 @@ Every read uses ``sep="\\t"``. Raw files are never modified.
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterator, Sequence
+from typing import Any, Iterable, Iterator, Sequence
 
+import numpy as np
 import pandas as pd
 
 TSV_SEP = "\t"
@@ -39,6 +41,28 @@ class GroundTruthError(ValueError):
 
 S1_ID_RE = re.compile(r"^S1-[A-Za-z0-9]+$")
 MATCH_ID_RE = re.compile(r"^S[23]-[A-Za-z0-9]+$")
+
+
+@dataclass
+class SampleDiagnostics:
+    """Diagnostic info returned by the smoke-sample loader.
+
+    ``rows_requested`` is the nominal cap (0/None = full load).
+    ``rows_loaded`` is the actual number of unique rows returned (may exceed
+    ``rows_requested`` if required positive IDs alone overflow the cap).
+    ``required_ids`` are the S2/S3 match IDs the caller asked to retain.
+    ``required_ids_found`` are the subset actually observed while streaming.
+    ``required_ids_missing`` are IDs listed as required but never encountered.
+    """
+
+    rows_requested: int
+    rows_loaded: int
+    required_ids: set[str] = field(default_factory=set)
+    required_ids_found: set[str] = field(default_factory=set)
+    required_ids_missing: set[str] = field(default_factory=set)
+    via_positive_keep: int = 0
+    via_sample: int = 0
+    stream_chunks: int = 0
 
 
 def _as_path(path: str | Path) -> Path:
@@ -184,6 +208,154 @@ def iter_source_chunks(
         if usecols is None:
             _require_columns(chunk, SOURCE_COLUMNS, path)
         yield chunk
+
+
+def _stream_sample_source(
+    path: str | Path,
+    *,
+    max_rows: int,
+    required_ids: Iterable[str] | None = None,
+    seed: int = 42,
+    chunksize: int = 50_000,
+) -> tuple[pd.DataFrame, SampleDiagnostics]:
+    """Memory-safe streaming S2/S3 sampler for diagnostic smoke tests.
+
+    The full TSV is NEVER materialized as a single DataFrame.
+    Rows are read in chunks; required IDs are always retained; the remaining
+    capacity is filled with a deterministic reservoir sample over the full
+    stream (skipping duplicates). Returns the resulting DataFrame plus
+    diagnostics about which required IDs were observed/missing.
+
+    If the set of required positive IDs alone exceeds ``max_rows``, every
+    required ID is still retained and the returned frame may be larger than
+    ``max_rows`` (overflow is tracked in diagnostics and reported to the
+    caller so it is never silent).
+    """
+    path = _as_path(path)
+    if max_rows is None or max_rows <= 0:
+        raise ValueError("max_rows must be a positive integer")
+    rng = np.random.default_rng(int(seed))
+
+    required = {str(eid) for eid in (required_ids or ()) if str(eid)}
+    seen_ids: set[str] = set()
+    kept_rows: list[dict[str, str]] = []
+    reservoir: list[dict[str, str]] = []
+    reservoir_cap = max(0, int(max_rows) - len(required))
+    # If required IDs alone already exceed max_rows, reservoir stays empty
+    # and we still collect every required row (returned size may exceed cap).
+    non_required_count = 0
+    required_found: set[str] = set()
+    chunks_seen = 0
+
+    for chunk in iter_source_chunks(path, chunksize=chunksize):
+        chunks_seen += 1
+        for row in chunk.itertuples(index=False):
+            mapping = {col: str(getattr(row, col, "")) for col in SOURCE_COLUMNS}
+            eid = mapping.get("entity_id", "")
+            if not eid or eid in seen_ids:
+                continue
+            if eid in required:
+                seen_ids.add(eid)
+                required_found.add(eid)
+                kept_rows.append(mapping)
+                continue
+            non_required_count += 1
+            if reservoir_cap <= 0:
+                continue
+            if len(reservoir) < reservoir_cap:
+                seen_ids.add(eid)
+                reservoir.append(mapping)
+            else:
+                # Algorithm R: reservoir sampling, 1-based index.
+                j = int(rng.integers(0, non_required_count))
+                if j < reservoir_cap:
+                    removed = reservoir[j]
+                    seen_ids.discard(removed.get("entity_id", ""))
+                    reservoir[j] = mapping
+                    seen_ids.add(eid)
+
+    merged = kept_rows + reservoir
+    frame = pd.DataFrame(merged, columns=list(SOURCE_COLUMNS))
+    # Preserve column order and str dtype.
+    for col in SOURCE_COLUMNS:
+        frame[col] = frame[col].astype(str)
+    _require_columns(frame, SOURCE_COLUMNS, path)
+
+    missing = required - required_found
+    diagnostics = SampleDiagnostics(
+        rows_requested=int(max_rows),
+        rows_loaded=int(frame.shape[0]),
+        required_ids=set(required),
+        required_ids_found=required_found,
+        required_ids_missing=missing,
+        via_positive_keep=len(kept_rows),
+        via_sample=len(reservoir),
+        stream_chunks=chunks_seen,
+    )
+    return frame, diagnostics
+
+
+def stream_sample_source2(
+    path: str | Path,
+    *,
+    max_rows: int,
+    required_ids: Iterable[str] | None = None,
+    seed: int = 42,
+    chunksize: int = 50_000,
+) -> tuple[pd.DataFrame, SampleDiagnostics]:
+    """Stream-sample S2. Thin wrapper around ``_stream_sample_source``."""
+    return _stream_sample_source(
+        path,
+        max_rows=max_rows,
+        required_ids=required_ids,
+        seed=seed,
+        chunksize=chunksize,
+    )
+
+
+def stream_sample_source3(
+    path: str | Path,
+    *,
+    max_rows: int,
+    required_ids: Iterable[str] | None = None,
+    seed: int = 42,
+    chunksize: int = 50_000,
+) -> tuple[pd.DataFrame, SampleDiagnostics]:
+    """Stream-sample S3. Thin wrapper around ``_stream_sample_source``."""
+    return _stream_sample_source(
+        path,
+        max_rows=max_rows,
+        required_ids=required_ids,
+        seed=seed,
+        chunksize=chunksize,
+    )
+
+
+def _required_match_ids(
+    gt_frame: pd.DataFrame,
+    s1_ids: Iterable[str],
+    *,
+    prefix: str,
+) -> set[str]:
+    """Return S2 or S3 true-match IDs referenced by the given S1 subset.
+
+    Scans only ground-truth rows whose source1_entity_id is in ``s1_ids``.
+    The full ground-truth table is loaded once up-front (its footprint is
+    ~127 MB for the training set), which is acceptable.
+    """
+    if prefix not in ("S2-", "S3-"):
+        raise ValueError(f"prefix must be 'S2-' or 'S3-', got {prefix!r}")
+    s1_set = {str(s) for s in s1_ids}
+    out: set[str] = set()
+    for row in gt_frame.itertuples(index=False):
+        s1 = str(getattr(row, "source1_entity_id", "")).strip()
+        if s1 not in s1_set:
+            continue
+        raw = getattr(row, "matched_entity_ids", None)
+        for mid in parse_matched_ids(raw, strict=True):
+            if str(mid).startswith(prefix):
+                out.add(str(mid))
+    return out
 
 
 def load_training_data(train_dir: str | Path) -> dict[str, pd.DataFrame]:
